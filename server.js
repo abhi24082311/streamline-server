@@ -55,6 +55,32 @@ function remuxWebm(inputPath, outputPath) {
     })
 }
 
+/**
+ * Extract a thumbnail frame from the video at a given timestamp.
+ * Uses FFmpeg to seek to `timeOffset` seconds and grab 1 frame as JPEG.
+ */
+function extractThumbnail(inputPath, outputPath, timeOffset = 1) {
+    return new Promise((resolve, reject) => {
+        ffmpeg(inputPath)
+            .seekInput(timeOffset)
+            .frames(1)
+            .outputOptions([
+                '-q:v 2',        // high quality JPEG (scale 2-31, lower = better)
+                '-vf scale=640:-2' // 640px width, auto height (even number)
+            ])
+            .output(outputPath)
+            .on('end', () => {
+                console.log('🖼️ Thumbnail extracted:', outputPath)
+                resolve()
+            })
+            .on('error', (err) => {
+                console.error('❌ FFmpeg thumbnail error:', err.message)
+                reject(err)
+            })
+            .run()
+    })
+}
+
 app.use(cors())
 
 const io = new Server(server, {
@@ -88,6 +114,10 @@ io.on('connection', (socket) => {
         const fixedFilename = data.filename.replace(/\.webm$/, '_fixed.webm')
         const fixedPath = path.join('temp_upload', fixedFilename)
 
+        // Thumbnail paths
+        const thumbnailFilename = data.filename.replace(/\.webm$/, '_thumb.jpg')
+        const thumbnailPath = path.join('temp_upload', thumbnailFilename)
+
         // 1. Mark video as processing in the DB (creates the video record)
         let processing;
         try {
@@ -112,7 +142,45 @@ io.on('connection', (socket) => {
             fs.copyFileSync(rawPath, fixedPath)
         }
 
-        // 3. Upload the fixed (seekable) file to S3
+        // 3. Extract thumbnail from the fixed video
+        try {
+            console.log('🖼️ Extracting thumbnail...')
+            await extractThumbnail(fixedPath, thumbnailPath, 1)
+
+            // Upload thumbnail to S3
+            const thumbBuffer = fs.readFileSync(thumbnailPath)
+            const thumbCommand = new PutObjectCommand({
+                Key: thumbnailFilename,
+                Bucket: process.env.BUCKET_NAME,
+                ContentType: 'image/jpeg',
+                Body: thumbBuffer,
+            })
+            const thumbStatus = await s3.send(thumbCommand)
+
+            if (thumbStatus['$metadata'].httpStatusCode === 200) {
+                console.log('🟢 Thumbnail uploaded to S3:', thumbnailFilename)
+
+                // Save thumbnail filename in the DB
+                try {
+                    await axios.post(
+                        `${process.env.NEXT_API_HOST}recording/${data.userId}/thumbnail`,
+                        { filename: data.filename, thumbnail: thumbnailFilename }
+                    )
+                    console.log('🟢 Thumbnail saved to DB')
+                } catch (dbErr) {
+                    console.error('❌ Failed to save thumbnail to DB:', dbErr.message)
+                }
+            } else {
+                console.log('❌ Thumbnail S3 upload failed')
+            }
+
+            // Clean up thumbnail temp file
+            fs.unlink(thumbnailPath, () => {})
+        } catch (err) {
+            console.error('❌ Thumbnail extraction failed (non-blocking):', err.message)
+        }
+
+        // 4. Upload the fixed (seekable) video file to S3
         const fileToUpload = fs.readFileSync(fixedPath)
         const command = new PutObjectCommand({
             Key: data.filename,
@@ -126,7 +194,7 @@ io.on('connection', (socket) => {
         if (fileStatus['$metadata'].httpStatusCode === 200) {
             console.log('🟢 Video uploaded to S3 (seekable)')
 
-            // 4. Transcribe + generate title/summary for ALL users (no plan gate)
+            // 5. Transcribe + generate title/summary for ALL users (no plan gate)
             try {
                 const stat = fs.statSync(fixedPath)
 
@@ -177,7 +245,7 @@ io.on('connection', (socket) => {
             console.log('❌ S3 upload failed')
         }
 
-        // 5. Mark processing as complete
+        // 6. Mark processing as complete
         const stopProcessing = await axios.post(
             `${process.env.NEXT_API_HOST}recording/${data.userId}/complete`,
             { filename: data.filename }
